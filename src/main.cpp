@@ -9,10 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define LED_PIN 15
 
-#define LED_PIN 4
-
-
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+DHT20 DHT;
 
 // The root certificate for validation
 static const char* root_ca = \
@@ -36,27 +37,40 @@ static const char* root_ca = \
 "Epn3o0WC4zxe9Z2etciefC7IpJ5OCBRLbf1wbWsaY71k5h+3zvDyny67G7fyUIhz\r\n"
 "ksLi4xaNmjICq44Y3ekQEe5+NauQrz4wlHrQMz2nZQ/1/I6eYs9HRCwBXbsdtTLS\r\n"
 "R9I4LtD+gdwyah617jzV/OeBHRnDJELqYzmp\r\n"
-"-----END CERTIFICATE-----\r\n";
+"-----END CERTIFICATE-----";
 
 
 // Replace with your network credentials
 const char* ssid     = "Chris' Iphone";
 const char* password = "chris1688";
 
-// Replace with your unique MQTT endpoint
-const char* mqtt_server = "CS147-Group14.azure-devices.net";
-const char* mqtt_user = "CS147-Group14.azure-devices.net/Espressif/?api-version=2021-04-12";
-const char* mqtt_password = "SharedAccessSignature sr=CS147-Group14.azure-devices.net%2Fdevices%2FEspressif&sig=DlgmSPsQ1GIS%2BX5gh%2BfnH%2FYglW%2BbU5U7mFgSrZp%2BTqE%3D&se=1686854868";
+// Website Connection
+const char* mqtt_server = "PlantMind.azure-devices.net";
+const char* mqtt_user = "PlantMind.azure-devices.net/esp32/api-version=2021-04-12";
+//set SharedAccessSignature for 504 hours (3 weeks)
+const char* mqtt_password = "SharedAccessSignature sr=PlantMind.azure-devices.net%2Fdevices%2Fesp32&sig=geD1KQfWHAFdMX7OcbA1epbSdOHbdgfYI3DwflJjMN0%3D&se=1688049518";
+//
 
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
-DHT20 DHT;
 
-long lastMsg = 0;
+
+
+
+const int relayPin = 2;
+const int sensorPin = A0;
+float soilMoisture = 0;
+
+
+
+const int relayAddress = 0x20; // I2C address of the relay module
+
+int UVOUT = 32; //Output from the sensor
+int REF_3V3 = 33; //3.3V power on the ESP32 board
+
+unsigned long lastMsg = 0; // global variable
 char msg[100];
 int value = 0;
 int messageID =0;
-String deviceID = "Espressif";
+String deviceID = "esp32";
 
 void syncTime() {
     configTime(0, 0, "pool.ntp.org");
@@ -108,6 +122,25 @@ void setup_wifi() {
   Serial.println(WiFi.localIP());
 }
 
+//Takes an average of readings on a given pin
+//Returns the average
+int averageAnalogRead(int pinToRead)
+{
+  byte numberOfReadings = 8;
+  unsigned int runningValue = 0; 
+ 
+  for(int x = 0 ; x < numberOfReadings ; x++)
+    runningValue += analogRead(pinToRead);
+  runningValue /= numberOfReadings;
+ 
+  return(runningValue);
+}
+
+float mapfloat(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
 void setup() {
   Serial.begin(9600);
   Wire.begin();
@@ -116,24 +149,32 @@ void setup() {
     Serial.println("Could not find a valid sensor, check wiring!");
     while (1);
   }
-  
+  WiFi.mode(WIFI_MODE_STA);
   setup_wifi();
   syncTime();
+
+
   espClient.setCACert(root_ca);
   client.setServer(mqtt_server, 8883);
   client.setCallback(callback);
 
   pinMode(LED_PIN, OUTPUT);
+  pinMode(relayPin, OUTPUT);
+  //sets pin 2 to output
+  pinMode(sensorPin, INPUT);
+  //sets pin A0 to input
+  digitalWrite(relayPin, HIGH);
+  //turns on relay, in turn turning on pump
+  //minMode for UV sensor
+  pinMode(UVOUT, INPUT);
+  pinMode(REF_3V3, INPUT);
+  delay(2000);
 }
-
-
-
-
 
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    if (client.connect("Espressif", mqtt_user, mqtt_password)) {
+    if (client.connect("esp32", mqtt_user, mqtt_password)) {
       Serial.println("connected");
     } else {
       Serial.print("failed, rc=");
@@ -149,20 +190,68 @@ void loop() {
     reconnect();
   }
   client.loop();
-
+  //Serial.println();
+  //Serial.print("MOISTURE LEVEL: ");
+  //prints "MOISTURE LEVEL: "
+  soilMoisture = analogRead(sensorPin);
+  //Serial.print(soilMoisture);
+  //Serial.println();
   long now = millis();
+  //sends message every 2 seconds
+  /*
+  if(sensorValue<3000)
+  {
+  digitalWrite(relayPin, HIGH);
+  Serial.println("Pump on");
+  }
+  else
+  {
+  digitalWrite(relayPin, LOW);
+  //if moisture level is not above 750, turns on pump
+  Serial.println("Pump off");
+  }
+  Serial.println();
+  */
+  //prints new line for spacing
+  delay(5000);
+
   if (now - lastMsg > 2000) {
     lastMsg = now;
     int status = DHT.read();
     float temp = DHT.getTemperature();
     float humidity = DHT.getHumidity();
+    
+    //client.disconnect();
+    //delay(500);
+
+    // Read UV level
+    int uvIntensity = averageAnalogRead(UVOUT);
+    int refLevel = averageAnalogRead(REF_3V3);
+
+    // Reconnect to MQTT server
+    //reconnect();
+  
+    //Use the 3.3V power pin as a reference to get a very accurate output value from sensor
+    float outputVoltage = 3.3 / refLevel * uvIntensity;
+  
+    float uvLevel = (mapfloat(outputVoltage, 0.99, 2.8, 0.0, 15.0)) / 25; //Convert the voltage to a UV intensity level
+    if (uvLevel < 0) {
+      uvLevel = uvLevel * -1;
+    }
+  //sets "sensorValue" to input value from A0
+    if(soilMoisture < 3000) {
+      digitalWrite(LED_PIN, HIGH);
+    } else if (soilMoisture > 3000) {
+      digitalWrite(LED_PIN, LOW);
+    }
+    delay(1000);
     messageID++;
     
     //sprintf(msg, "{\"Temperature\": %.2f, \"Humidity\": %.2f}", temp, humidity);
-    sprintf(msg, "{\"messageId\": %d, \"deviceId\": \"%s\", \"temperature\": %.2f, \"humidity\": %.2f}",
-            messageID, deviceID, temp, humidity);
+    sprintf(msg, "{\"messageId\": %d, \"deviceId\": \"%s\", \"temperature\": %.2f, \"humidity\": %.2f, \"soilMoisture\": %.2f, \"uvLevel\": %.2f}",
+            messageID, deviceID, temp, humidity, soilMoisture, uvLevel);
     Serial.print("Publish message: ");
     Serial.println(msg);
-    client.publish("devices/Espressif/messages/events/", msg);
+    client.publish("devices/esp32/messages/events/", msg);
   }
 }
